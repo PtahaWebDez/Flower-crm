@@ -3,19 +3,21 @@ import pandas as pd
 import os
 import unicodedata
 from urllib.parse import unquote
+import shutil
+from datetime import datetime
 
 app = Flask(__name__)
 
 EXCEL_FILE = "bouquets.xlsx"
 SHEET_NAME = "CRM"
 
-# заказы в памяти
+
 orders = []
 next_order_id = 1
 
-# --------- утилиты ----------
+
 def norm(s):
-    """Нормализация: убирает NBSP, лишние пробелы, приводим к нижнему регистру, ё->е"""
+    
     if s is None:
         return ""
     s = str(s)
@@ -27,11 +29,7 @@ def norm(s):
     return s.lower()
 
 def load_data():
-    """
-    Читает EXCEL_FILE sheet SHEET_NAME и возвращает:
-      bouquets: { normalized_bouquet_name: { flower_column_label: qty, ... }, ... }
-      inventory: { flower_column_label: qty, ... }
-    """
+    
     if not os.path.exists(EXCEL_FILE):
         return {}, {}
 
@@ -44,19 +42,19 @@ def load_data():
     name_col = cols[0]
     flower_cols = cols[1:]
 
-    # найти строку "склад" в колонке name_col (независимо от регистра/пробелов)
+    
     mask = df[name_col].astype(str).fillna('').map(lambda x: norm(x) == 'склад')
     sklad_rows = df[mask].index
     if len(sklad_rows) == 0:
-        # попробуем частичное вхождение
+        
         mask2 = df[name_col].astype(str).fillna('').map(lambda x: 'склад' in norm(x))
         sklad_rows = df[mask2].index
         if len(sklad_rows) == 0:
-            # не нашли строку склад — вернём пустые структуры
+            
             return {}, {}
     sklad_row = sklad_rows[0]
 
-    # читаем букеты (все строки до sklad_row)
+    
     bouquets = {}
     for idx in df.index:
         if idx >= sklad_row:
@@ -80,7 +78,7 @@ def load_data():
         if comp:
             bouquets[b_name] = comp
 
-    # читаем склад из строки sklad_row
+    
     inventory = {}
     for col in flower_cols:
         val = df.at[sklad_row, col]
@@ -93,7 +91,7 @@ def load_data():
     return bouquets, inventory
 
 def save_inventory(inventory):
-    """Записывает inventory (keys — реальные заголовки столбцов цветов) в строку 'склад' Excel."""
+    
     if not os.path.exists(EXCEL_FILE):
         raise FileNotFoundError("Excel файл не найден")
 
@@ -104,7 +102,7 @@ def save_inventory(inventory):
     name_col = cols[0]
     flower_cols = cols[1:]
 
-    # найти строку "склад"
+    
     mask = df[name_col].astype(str).fillna('').map(lambda x: norm(x) == 'склад')
     sklad_rows = df[mask].index
     if len(sklad_rows) == 0:
@@ -114,19 +112,236 @@ def save_inventory(inventory):
             raise ValueError("Не найдена строка 'склад' при сохранении")
     sklad_row = sklad_rows[0]
 
-    # записываем значения
+    
     for col in flower_cols:
         key = str(col)
         if key in inventory:
             df.at[sklad_row, col] = int(inventory[key])
 
-    # сохраняем лист
+    
     df.to_excel(EXCEL_FILE, sheet_name=SHEET_NAME, index=False, engine="openpyxl")
 
+def backup_excel():
+    if not os.path.exists(EXCEL_FILE):
+        return
 
-# ---------- помощники для заказов ----------
+    os.makedirs("backups", exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_name = f"backups/bouquets_{timestamp}.xlsx"
+
+    shutil.copy2(EXCEL_FILE, backup_name)
+
+@app.route("/excel")
+def excel_editor():
+    if not os.path.exists(EXCEL_FILE):
+        return "Excel файл не найден", 404
+
+    df = pd.read_excel(EXCEL_FILE, sheet_name=SHEET_NAME, engine="openpyxl", dtype=object)
+    df = df.fillna("")
+    EMPTY_ROWS = 10
+
+    cols = list(df.columns)
+    name_col = cols[0]
+
+
+    mask = df[name_col].astype(str).fillna("").map(lambda x: norm(x) == "склад")
+    sklad_idx = df[mask].index
+
+    if len(sklad_idx) > 0:
+        i = sklad_idx[0]
+
+        empty_rows = pd.DataFrame(
+            [[""] * len(df.columns) for _ in range(EMPTY_ROWS)],
+            columns=df.columns
+        )
+
+        df = pd.concat(
+            [df.iloc[:i], empty_rows, df.iloc[i:]],
+            ignore_index=True
+        )
+    EMPTY_COLS = 5
+    for i in range(EMPTY_COLS):
+        df[f""] = ""
+
+    return render_template_string("""
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Редактор Excel</title>
+<style>
+table { border-collapse: collapse; }
+td, th { border: 1px solid #ccc; padding: 6px; min-width: 80px; }
+td { cursor: text; }
+th { background: #f3f3f3; }
+.sklad { background: #fff3cd; }
+button { margin-top: 15px; padding: 8px 16px; }
+
+.table-wrap {
+  max-width: 100%;
+  max-height: 70vh;
+  overflow: auto;
+  border: 1px solid #ccc;
+}
+
+#excel thead th {
+  position: sticky;
+  top: 0;
+  background: #f3f3f3;
+  z-index: 3;
+}
+
+#excel th:first-child,
+#excel td:first-child {
+  position: sticky;
+  left: 0;
+  background: #fafafa;
+  z-index: 2;
+}
+
+#excel thead th:first-child {
+  z-index: 4;
+  background: #eaeaea;
+}
+</style>
+</head>
+<body>
+
+<h2>Редактор базы (Excel)</h2>
+
+<div class="table-wrap">
+  <table id="excel">
+<thead>
+<tr>
+{% for col in df.columns %}
+<th contenteditable="true">{{ col }}</th>
+{% endfor %}
+</tr>
+</thead>
+<tbody>
+{% for _, row in df.iterrows() %}
+<tr class="{{ 'sklad' if row.iloc[0]|lower == 'склад' else '' }}">
+{% for cell in row %}
+<td contenteditable="true">{{ cell }}</td>
+{% endfor %}
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+
+<br>
+<button onclick="saveExcel()">Сохранить</button>
+<p id="msg" style="color:red;"></p>
+
+<script>
+function saveExcel() {
+    const table = document.getElementById("excel");
+    const data = [];
+
+    for (let r of table.rows) {
+        const row = [];
+        for (let c of r.cells) {
+            row.push(c.innerText.trim());
+        }
+        data.push(row);
+    }
+
+    fetch("/excel/save", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({table: data})
+    })
+    .then(r => r.json())
+    .then(resp => {
+        document.getElementById("msg").innerText = resp.message;
+        if (resp.ok) document.getElementById("msg").style.color = "green";
+    });
+}
+</script>
+
+</body>
+</html>
+""", df=df)
+
+@app.route("/excel/save", methods=["POST"])
+def excel_save():
+    data = request.json.get("table", [])
+
+    if len(data) < 2:
+        return jsonify(ok=False, message="Пустая таблица"), 400
+
+    headers = data[0]
+    rows = data[1:]
+    clean_headers = []
+    seen = set()
+
+    for h in headers:
+        name = str(h).strip()
+        if name == "":
+            clean_headers.append(None)
+            continue
+
+        orig = name
+        i = 1
+        while name in seen:
+            name = f"{orig}_{i}"
+            i += 1
+
+        seen.add(name)
+        clean_headers.append(name)
+    
+    df = pd.DataFrame(rows, columns=clean_headers)
+    df = df.loc[:, df.columns.notna()]
+
+    
+    for col in df.columns[1:]:
+        df[col] = df[col].apply(lambda x: 0 if str(x).strip() == "" else x)
+        df[col] = pd.to_numeric(df[col], errors="ignore")
+
+    name_col = df.columns[0]
+
+    
+    df = df.loc[:, ~(df.astype(str).apply(
+        lambda col: col.str.strip().eq("").all()
+    ))]
+
+    
+    df = df[~(df.astype(str).apply(
+        lambda row: row.str.strip().eq("").all(), axis=1
+    ))]
+
+    
+    mask = df[name_col].astype(str).map(lambda x: norm(x) == "склад")
+    if not mask.any():
+        return jsonify(
+            ok=False,
+            message="Строка «Склад» обязательна и не может быть удалена"
+        )
+
+    
+    sklad_row = df[mask]
+    df = df[~mask]
+    df = pd.concat([df, sklad_row], ignore_index=True)
+
+    backup_excel()
+
+
+    df.to_excel(
+        EXCEL_FILE,
+        sheet_name=SHEET_NAME,
+        index=False,
+        engine="openpyxl"
+    )
+
+    return jsonify(ok=True, message="Excel успешно сохранён")
+
+
+
 def recompute_order_summary(order):
-    """Пересчитать order['состав'] и order['букет'] по order['букеты'].""" 
+     
     total = {}
     if 'букеты' in order:
         for b in order['букеты']:
@@ -135,12 +350,12 @@ def recompute_order_summary(order):
         order['состав'] = total
         order['букет'] = ", ".join([b.get('название', '') for b in order['букеты']])
     else:
-        # если старый формат — ничего не трогаем
+        
         pass
     return order
 
 def ensure_order_buckets(order):
-    """Если у заказа нет ключа 'букеты', создаём его из старого формата (для совместимости)."""
+    
     if 'букеты' not in order:
         name = order.get('букет', '')
         comp = order.get('состав', {}) or {}
@@ -170,6 +385,9 @@ HTML = '''
 </style>
 
 <h2>Проверить возможность сборки букета</h2>
+<a href="/excel" target="_blank">
+  <button class="btn">База / Excel</button>
+</a>
 <form id="checkForm">
   <input type="text" name="bouquet" placeholder="Название букета" autofocus>
   <input type="submit" value="Проверить" class="btn">
@@ -290,7 +508,7 @@ window.tempOrder = tempOrder;
 })
       .then(r => r.json())
       .then(data => {
-        // сохраняем для возможного отображения замен
+        
         window._lastInventory = data.остатки || {};
         let html = `<p><b>${data.букет}</b></p><p>Состав: `;
         for (let f in data.состав) html += `${f}: ${data.состав[f]} `;
@@ -299,14 +517,14 @@ window.tempOrder = tempOrder;
         if (data.статус === 'возможно') {
           html += `<button class="btn bookNowBtn" data-bouquet="${(data.букет||'').replace(/"/g,'&quot;')}">Забронировать</button> `;
           html += `<button class="btn addBtn" data-bouquet="${(data.букет||'').replace(/"/g,'&quot;')}">Добавить в заказ</button>`;
-          // добавляем кнопку "Добавить с заменой" — пометка, замена будет вручную в таблице
+          
           html += ` <button class="btn replacementBtn" data-bouquet="${(data.букет||'').replace(/"/g,'&quot;')}">Добавить с заменой в заказ</button>`;
         } else {
-          // при ошибке (недостаток) всё равно показываем кнопку "Собрать с заменой" (альтернатива)
+          
           html += `<button class="btn replacementBtn" data-bouquet="${(data.букет||'').replace(/"/g,'&quot;')}">Добавить с заменой в заказ</button>`;
         }
 
-        // показать остатки для удобства
+        
         html += `<details style="margin-top:8px"><summary>Остатки</summary><pre style="white-space:pre-wrap;">${JSON.stringify(data.остатки || {}, null, 2)}</pre></details>`;
         checkResultDiv.innerHTML = html;
       }).catch(err=>{
@@ -315,7 +533,7 @@ window.tempOrder = tempOrder;
       });
   });
 
-  // добавление обычного букета в tempOrder (клиентская корзина)
+  
   window.addToTemp = function(name){
     const fd = new FormData();
     fd.append('bouquet', name);
@@ -428,7 +646,7 @@ window.tempOrder = tempOrder;
     });
   });
 
-  // редактирование имени каждого букета (при наличии нескольких)
+  
   document.querySelectorAll('.bouquet-block').forEach(div=>{
     div.addEventListener('blur', function(){
       const tr = this.closest('tr');
@@ -443,7 +661,7 @@ window.tempOrder = tempOrder;
     });
   });
 
-  // редактирование состава вручную для конкретного букета (comp-block)
+  
   document.querySelectorAll('.comp-block').forEach(block=>{
     block.dataset.orig = (block.innerText || "").trim();
     block.addEventListener('blur', function(){
@@ -467,7 +685,7 @@ window.tempOrder = tempOrder;
     });
   });
 
-  // qty-cell (редактирование количества для конкретного букета)
+  
   document.querySelectorAll('.qty-cell').forEach(span=>{
     span.addEventListener('blur', function(){
       const tr = this.closest('tr');
@@ -540,13 +758,13 @@ document.addEventListener('click', function(e){
   const bouquetName = (e.target.dataset.bouquet || '').trim();
   console.log('Добавляем букет с заменой:', bouquetName);
 
-  // гарантируем, что tempOrder существует
+  
   window.tempOrder = window.tempOrder || [];
 
-  // приведение всех названий к единому виду (в нижний регистр)
+  
   const baseName = bouquetName.toLowerCase();
 
-  // считаем, сколько уже есть похожих букетов (с тем же baseName)
+  
   const countSame = window.tempOrder.filter(b => {
     if (typeof b === 'string') {
       return b.toLowerCase().startsWith(baseName);
@@ -556,13 +774,13 @@ document.addEventListener('click', function(e){
     return false;
   }).length;
 
-  // формируем новое имя
+  
   const displayName =
     countSame > 0
       ? `${bouquetName} (с заменой ${countSame + 1})`
       : `${bouquetName} (с заменой)`;
 
-  // добавляем букет как объект
+  
   window.tempOrder.push({
     название: displayName,
     состав: {},
@@ -571,10 +789,10 @@ document.addEventListener('click', function(e){
 
   console.log('Теперь tempOrder:', window.tempOrder);
 
-  // перерисовываем временный заказ
+  
   if (typeof renderTemp === 'function') renderTemp();
 
-  // очищаем блок проверки
+  
   const cr = document.getElementById('checkResult');
   if (cr) cr.innerHTML = '';
 }
@@ -639,7 +857,7 @@ window.addReplacementToTempSimple = function(bouquetName){
 </script>
 '''
 
-# --------- логика работы ------------
+
 def check_order_with_data(name, bouquets, inventory):
     name_l = norm(name)
 
@@ -676,13 +894,13 @@ def check_order_with_data(name, bouquets, inventory):
 
 
 def book_order_with_data(bouquet_name, bouquets, inventory):
-    """Бронирует один букет — создаёт заказ с 'букеты' (список из 1 элемента) + совместимые поля."""
+    
     global next_order_id
     res = check_order_with_data(bouquet_name, bouquets, inventory)
     if res['статус'] != 'возможно':
         return None
     recipe = res['состав'].copy()
-    # списываем
+    
     for f, q in recipe.items():
         inventory[f] = inventory.get(f, 0) - q
     save_inventory(inventory)
@@ -707,7 +925,7 @@ def index():
         bouquets, inventory = load_data()
     except Exception:
         bouquets, inventory = {}, {}
-    # Для отображения: убедимся, что у каждого заказа есть 'букеты' (для совместимости)
+    
     for o in orders:
         ensure_order_buckets(o)
     return render_template_string(HTML, orders=orders, inventory=inventory)
@@ -720,7 +938,7 @@ def check():
     except Exception:
         return jsonify({"букет": "", "состав": {}, "статус": "ошибка", "сообщение": "Ошибка чтения Excel"}), 500
 
-    # поддерживаем form-data (форма) и json (внешние вызовы)
+    
     if request.is_json:
         data = request.get_json() or {}
         name = (data.get("bouquet") or "").strip()
@@ -729,7 +947,7 @@ def check():
         name = request.form.get("bouquet", "").strip()
         temp = []
 
-    # учтём временные заказы (temp) — уменьшим копию inventory
+    
     inv_copy = inventory.copy()
     for item in temp:
         if isinstance(item, dict):
@@ -877,7 +1095,7 @@ def delete_order(index):
             bouquets, inventory = load_data()
         except:
             inventory = {}
-        # вернуть на склад: если есть 'букеты' — суммируем по всем, иначе старый формат
+        
         if 'букеты' in orders[index]:
             for b in orders[index]['букеты']:
                 for f, q in b['состав'].items():
@@ -892,7 +1110,7 @@ def delete_order(index):
 
 @app.route("/edit_order/<int:index>", methods=["POST"])
 def edit_order(index):
-    """Редактирование имени букета. Поддерживается bouquet_idx для редактирования конкретного букета внутри заказа."""
+    
     data = request.get_json() or {}
     new_name = (data.get("new_name") or "").strip()
     try:
@@ -937,8 +1155,7 @@ def edit_inventory(flower):
 
 @app.route("/edit_order_qty/<int:index>", methods=["POST"])
 def edit_order_qty(index):
-    """Редактирование количества конкретного цветка в конкретном букете заказа.
-       Принимает JSON {flower, new_qty, bouquet_idx} (bouquet_idx optional, default 0)."""
+    
     data = request.get_json() or {}
     flower = data.get("flower")
     try:
@@ -959,7 +1176,7 @@ def edit_order_qty(index):
         inventory = {}
 
     order = orders[index]
-    # если есть 'букеты', работаем с указанным букетом
+    
     if 'букеты' in order:
         if not (0 <= bouquet_idx < len(order['букеты'])):
             return '', 400
@@ -971,13 +1188,13 @@ def edit_order_qty(index):
         if inventory.get(flower, 0) - diff < 0:
             return '', 400
         comp[flower] = new_qty
-        # обновляем суммарный состав и записываем
+        
         recompute_order_summary(order)
         inventory[flower] = inventory.get(flower, 0) - diff
         save_inventory(inventory)
         return '', 204
     else:
-        # старый формат
+        
         if flower not in order['состав']:
             return '', 400
         old_qty = order['состав'][flower]
@@ -992,10 +1209,7 @@ def edit_order_qty(index):
 
 @app.route("/edit_order_composition/<int:index>", methods=["POST"])
 def edit_order_composition(index):
-    """
-    Редактирование состава вручную. JSON: { bouquet_idx (optional), composition: "цвет: число\n..." }
-    Изменяет состав конкретного букета (если есть 'букеты') или старого формата.
-    """
+    
     data = request.get_json() or {}
     new_text = data.get("composition", "")
     try:
@@ -1011,7 +1225,7 @@ def edit_order_composition(index):
     except:
         return jsonify({"status":"ошибка","message":"Ошибка чтения Excel"}), 500
 
-    # парсим строки вида "Цветок: число"
+    
     new_comp = {}
     for line in new_text.splitlines():
         if ":" not in line:
@@ -1026,22 +1240,22 @@ def edit_order_composition(index):
             new_comp[flower] = qty
 
     order = orders[index]
-    # работа для детального формата
+    
     if 'букеты' in order:
         if not (0 <= bouquet_idx < len(order['букеты'])):
             return jsonify({"status":"ошибка","message":"Неверный индекс букета в заказе"}), 400
         old_comp = order['букеты'][bouquet_idx]['состав']
-        # вернуть старый на склад
+        
         for f, q in old_comp.items():
             inventory[f] = inventory.get(f, 0) + q
-        # проверить новые
+        
         for f, q in new_comp.items():
             if inventory.get(f, 0) < q:
-                # откат возврата
+                
                 for f2, q2 in old_comp.items():
                     inventory[f2] = inventory.get(f2, 0) - q2
                 return jsonify({"status":"ошибка","message":f"Недостаточно {f} (осталось {inventory.get(f,0)})"}), 400
-        # списать новые
+       
         for f, q in new_comp.items():
             inventory[f] = inventory.get(f, 0) - q
         order['букеты'][bouquet_idx]['состав'] = new_comp
@@ -1049,7 +1263,7 @@ def edit_order_composition(index):
         save_inventory(inventory)
         return '', 204
     else:
-        # старый формат
+        
         old_comp = order['состав']
         for f, q in old_comp.items():
             inventory[f] = inventory.get(f, 0) + q
@@ -1103,10 +1317,7 @@ def debug_data():
 
 @app.route("/book_with_replacement", methods=["POST"])
 def book_with_replacement():
-    """
-    Подготовить букет с заменой: вернуть объект {"название","состав","with_replacement": True}.
-    НЕ списывать инвентарь и НЕ создавать заказ — это делается при finalize (/book_batch).
-    """
+    
     data = request.get_json() or {}
     name = (data.get("original_bouquet") or "").strip()
     replacements = data.get("replacements", [])
@@ -1115,10 +1326,10 @@ def book_with_replacement():
     if norm(name) not in bouquets:
         return jsonify({"error": "Неизвестный букет"}), 400
 
-    # исходный рецепт (копия)
+    
     recipe = bouquets[norm(name)].copy()
 
-    # применяем замены: только увеличиваем состав тем, что выбрал пользователь
+    
     for repl in replacements:
         rf = repl.get('flower')
         try:
@@ -1128,7 +1339,7 @@ def book_with_replacement():
         if rq > 0:
             recipe[rf] = recipe.get(rf, 0) + rq
 
-    # возвращаем подготовленный букет (без списания, без создания заказа)
+    
     return jsonify({
         "название": f"{name} (с заменой)",
         "состав": recipe,
