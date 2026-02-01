@@ -249,7 +249,7 @@ function saveExcel() {
         data.push(row);
     }
 
-    fetch("/excel/save", {
+    fetch(window.location.origin + "/excel/save", {
         method: "POST",
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({table: data})
@@ -1349,3 +1349,4 @@ def book_with_replacement():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
